@@ -1,0 +1,42 @@
+[package]
+name = "csi-breathing"
+version = "0.1.0"
+edition = "2024"
+description = "WiFi CSI breathing monitor: ESP32-C5 TX/RX, breath tests, overnight recording and analysis, Fitbit comparison"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "persistence"] }
+egui_plot = "0.37"
+rustfft = "6"
+nalgebra = "0.35"
+rayon = "1"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+anyhow = "1"
+ureq = { version = "3", features = ["json"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+serialport = "4"
+espflash = { version = "4.6", default-features = false, features = ["serialport"] }
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ab_glyph", "line_series", "point_series", "area_series"] }
+dirs = "6"
+open = "5"
+rfd = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+opt-level = 2

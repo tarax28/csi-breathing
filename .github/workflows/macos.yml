@@ -1,0 +1,46 @@
+name: macOS build
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Make the universal app bundle
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          app="dist/CSI Breathing.app"
+          mkdir -p "$app/Contents/MacOS"
+          lipo -create -output "$app/Contents/MacOS/csi-breathing" \
+            target/aarch64-apple-darwin/release/csi-breathing \
+            target/x86_64-apple-darwin/release/csi-breathing
+          sed "s/VERSION/$version/" macos/Info.plist > "$app/Contents/Info.plist"
+          # ad-hoc signature: Apple Silicon refuses to run unsigned code
+          codesign --force --deep --sign - "$app"
+          codesign --verify --verbose "$app"
+          lipo -info "$app/Contents/MacOS/csi-breathing"
+          "$app/Contents/MacOS/csi-breathing" selftest
+          ditto -c -k --keepParent "$app" dist/csi-breathing-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csi-breathing-macos
+          path: dist/csi-breathing-macos.zip

@@ -1,0 +1,4 @@
+# Link libunwind (and the rest of the llvm-mingw runtime) statically, so the Windows exe
+# does not need libunwind.dll next to it.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static"]
