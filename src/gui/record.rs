@@ -314,7 +314,7 @@ impl RecordPage {
                 });
             });
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 40.0;
                 let s = &self.stats;
                 theme::stat(ui, &s.elapsed_h.map(hours).unwrap_or("–".into()), "", "recorded");
@@ -328,7 +328,7 @@ impl RecordPage {
                 theme::small(ui, format!("Folder {}", d.display()));
             }
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if rec {
                     if theme::primary(ui, "Stop recording", true).clicked() {
                         self.stop();

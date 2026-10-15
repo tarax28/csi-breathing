@@ -25,6 +25,11 @@ pub const SHIFT_ON: f64 = 7.5; // 4.5 / 2.0 before the amplitude-first resample 
 pub const SHIFT_OFF: f64 = 3.5;
 pub const TRACK_LAMBDA: f64 = 1.0;
 pub const REG_MIN: f64 = 0.45;
+pub const SEG_SHIFT: f64 = SHIFT_OFF; // the waveform is rebuilt after any profile shift above this
+pub const SEG_MIN_S: f64 = 20.0; // shortest still stretch that gets a waveform
+pub const HALF_WIN_S: f64 = 20.0; // window of the even/odd subcarrier agreement
+pub const HALF_CORR: f64 = 0.98; // agreement above this = a real channel signal (lower-confidence tier)
+pub const LOW_MIN: usize = 12; // lower-confidence readings an epoch needs for its own median
 pub const STAGES: [&str; 4] = ["deep", "light", "rem", "wake"];
 
 pub fn clock(t: f64, fmt: &str) -> String {
@@ -209,8 +214,9 @@ pub fn profile_shift(tl: &Timeline) -> Vec<f64> {
     d
 }
 
-/// (mask per FS sample, events (start s, end s, peak x median))
-pub fn movement(tl: &Timeline) -> (Vec<bool>, Vec<(usize, usize, f64)>) {
+/// (mask per FS sample, events (start s, end s, peak x median), unsettled mask per FS sample:
+/// movement or any profile shift above SEG_SHIFT)
+pub fn movement(tl: &Timeline) -> (Vec<bool>, Vec<(usize, usize, f64)>, Vec<bool>) {
     let d = profile_shift(tl);
     let inner = if d.len() > 2 * SHIFT_W { &d[SHIFT_W..d.len() - SHIFT_W] } else { &d[..] };
     let med = dsp::median(inner) + 1e-12;
@@ -227,20 +233,153 @@ pub fn movement(tl: &Timeline) -> (Vec<bool>, Vec<(usize, usize, f64)>) {
             *v = true;
         }
     }
-    (mask, ev)
+    let mut uns = mask.clone();
+    for (t, &v) in r.iter().enumerate() {
+        if v > SEG_SHIFT {
+            for u in &mut uns[(t * FS as usize).min(tl.n)..((t + 1) * FS as usize).min(tl.n)] {
+                *u = true;
+            }
+        }
+    }
+    (mask, ev, uns)
 }
 
 // ----------------------------------------------------------------- chunks
 struct Chunk {
     b: Breaths,
+    /// usable in the lower-confidence tier only (per breath)
+    low: Vec<bool>,
     ft: Vec<f64>,
     fv: Vec<f64>,
+    /// lower-confidence rate where fv has none
+    fl: Vec<f64>,
     q: Vec<u8>,
     present: Vec<bool>,
+    present_low: Vec<bool>,
     x: Vec<f32>,
 }
 
-fn analyse_chunk(tl: &Timeline, mot: &[bool], c0: f64) -> Chunk {
+fn band(x: &[f64]) -> Vec<f64> {
+    dsp::sosfiltfilt(&dsp::butter_bandpass(3, an::BAND.0, an::BAND.1, FS), x)
+}
+
+/// Every second column of h, from `first` (the even or the odd subcarriers).
+fn every_other(h: &CMat, first: usize) -> CMat {
+    let cols: Vec<usize> = (first..h.m).step_by(2).collect();
+    let mut d = Vec::with_capacity(h.n * cols.len());
+    for &j in &cols {
+        d.extend_from_slice(h.col(j));
+    }
+    CMat { n: h.n, m: cols.len(), d }
+}
+
+/// analysis::breathing_waveform for every still stretch on its own, each oriented (inhale up) and
+/// scaled to unit typical amplitude so the stretches can stand in one series; zero elsewhere. Also
+/// the same waveform from the even and from the odd subcarriers alone, flipped to agree with the
+/// full one: two measurements of the breathing that share no receiver noise.
+fn stretch_waveform(h: &CMat, still: &[bool]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (mut w, mut we, mut wo) = (vec![0.0; h.n], vec![0.0; h.n], vec![0.0; h.n]);
+    let n8 = (8.0 * FS) as usize;
+    let st: Vec<u8> = still.iter().map(|&v| v as u8).collect();
+    for (lo, hi, _) in dsp::runs(&st) {
+        if ((hi - lo) as f64) < SEG_MIN_S * FS {
+            continue;
+        }
+        let hs = h.rows(lo, hi);
+        let (ws, _, _) = an::breathing_waveform(&hs, an::Method::Snr);
+        let x = band(&ws);
+        let half = |first: usize| -> Vec<f64> {
+            let (hw, _, _) = an::breathing_waveform(&every_other(&hs, first), an::Method::Snr);
+            let d: f64 = band(&hw).iter().zip(&x).map(|(a, b)| a * b).sum();
+            let sg = if d < 0.0 { -1.0 } else { 1.0 };
+            hw.iter().map(|v| v * sg).collect()
+        };
+        let (e, o) = (half(0), half(1));
+        let sq: Vec<f64> = x.iter().map(|v| v * v).collect();
+        let env: Vec<f64> = dsp::convolve_box_same(&sq, n8, 1.0 / n8 as f64).iter().map(|v| v.max(0.0).sqrt() + 1e-9).collect();
+        let xn: Vec<f64> = x.iter().zip(&env).map(|(a, b)| a / b).collect();
+        let k = an::orient(&xn, &x) as f64 / (dsp::median(&env) + 1e-12);
+        for i in 0..hi - lo {
+            w[lo + i] = ws[i] * k;
+            we[lo + i] = e[i] * k;
+            wo[lo + i] = o[i] * k;
+        }
+    }
+    (w, we, wo)
+}
+
+/// Correlation of the even- and odd-subcarrier waveforms over HALF_WIN_S around each sample
+/// (motion zeroed). Near 1 = the breathing band holds a channel change much larger than the
+/// receiver noise; it says nothing about how regular that change is.
+fn half_agreement(we: &[f64], wo: &[f64], q: &[u8]) -> Vec<f64> {
+    let clean = |v: &[f64]| -> Vec<f64> { band(v).iter().zip(q).map(|(x, &qq)| if qq == 2 { 0.0 } else { *x }).collect() };
+    let (a, b) = (clean(we), clean(wo));
+    let len = a.len();
+    let n = ((HALF_WIN_S * FS) as usize).min(len);
+    // numpy.convolve(v, ones(n), "same"), summed directly: prefix sums would leave rounding
+    // noise where both waveforms are zero, and there the ratio below is 0 / 0
+    let off = (n - 1) / 2;
+    (0..len)
+        .map(|k| {
+            let hi = (k + off).min(len - 1);
+            let lo = (k + off).saturating_sub(n - 1);
+            let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+            for i in lo..=hi {
+                ab += a[i] * b[i];
+                aa += a[i] * a[i];
+                bb += b[i] * b[i];
+            }
+            ab / ((aa * bb).sqrt() + 1e-12)
+        })
+        .collect()
+}
+
+/// The lower-confidence tier: breathing also counts as present where the two subcarrier halves
+/// agree (c >= HALF_CORR). The breaths that were rejected only for "no breathing signal" are
+/// judged again with the same rules as in analysis::detect_breaths. Returns (present, ok).
+fn open_presence(br: &Breaths, c: &[f64]) -> (Vec<bool>, Vec<bool>) {
+    let n = br.present.len();
+    let mut pres: Vec<bool> = (0..n).map(|i| br.present[i] || c[i] >= HALF_CORR).collect();
+    let pi: Vec<u8> = pres.iter().map(|&v| v as u8).collect();
+    for (lo, hi, _) in dsp::runs(&pi) {
+        if ((hi - lo) as f64 / FS) < an::PRESENCE_MIN_S && lo > 0 && hi < n {
+            pres[lo..hi].fill(false);
+        }
+    }
+    for i in 0..n {
+        pres[i] |= br.present[i];
+    }
+    let nb = br.len();
+    let mut ok = br.ok.clone();
+    let mut cand = vec![];
+    for i in 0..nb {
+        if br.why[i] != "no breathing signal" {
+            continue;
+        }
+        let a = (br.tr[i] * FS) as usize;
+        let e = ((br.nxt[i] * FS) as usize + 1).min(n);
+        let len = (e - a).max(1) as f64;
+        let share = |f: &dyn Fn(usize) -> bool| (a..e).filter(|&j| f(j)).count() as f64 / len;
+        if share(&|j| pres[j]) >= 0.5 && !br.q[a..e].contains(&2) && share(&|j| br.q[j] == 1) <= 0.5 && 60.0 / 45.0 < br.ttot[i] && br.ttot[i] < 60.0 / 4.0 {
+            cand.push(i);
+        }
+    }
+    for &i in &cand {
+        ok[i] = true;
+    }
+    for &i in &cand {
+        let nbv: Vec<f64> = (i.saturating_sub(3)..(i + 4).min(nb)).filter(|&j| j != i && ok[j]).map(|j| br.ttot[j]).collect();
+        let loc = if nbv.len() >= 2 { dsp::median(&nbv) } else { br.ttot[i] };
+        let pri = 60.0 / br.prior[((br.tr[i] * FS) as usize).min(n - 1)];
+        let t = br.ttot[i];
+        if !((0.55 * loc < t && t < 1.7 * loc) || (0.6 * pri < t && t < 1.6 * pri)) {
+            ok[i] = false;
+        }
+    }
+    (pres, ok)
+}
+
+fn analyse_chunk(tl: &Timeline, mot: &[bool], uns: &[bool], c0: f64) -> Chunk {
     let len = tl.n;
     let n0 = (c0 * FS) as usize;
     let n1 = (((c0 + CHUNK_S) * FS) as usize).min(len);
@@ -249,10 +388,15 @@ fn analyse_chunk(tl: &Timeline, mot: &[bool], c0: f64) -> Chunk {
     if ((n1 - n0) as f64) < 60.0 * FS {
         a = n1.saturating_sub(((CHUNK_S + PAD_S) * FS) as usize);
     }
-    let h = tl.rows(a, b);
-    let (w, _, _) = an::breathing_waveform(&h, an::Method::Snr);
-    let br = an::detect_breaths(&w, None, Some(&mot[a..b]));
+    let still: Vec<bool> = uns[a..b].iter().map(|&u| !u).collect();
+    let (w, we, wo) = stretch_waveform(&tl.rows(a, b), &still);
+    let br = an::detect_breaths(&w, Some(1), Some(&mot[a..b])); // the stretches are already oriented
     let (ft, fv) = an::fused_rate(&br);
+    let (present_low, ok_low) = open_presence(&br, &half_agreement(&we, &wo, &br.q));
+    let low: Vec<bool> = (0..br.len()).map(|i| ok_low[i] && !br.ok[i]).collect();
+    let lc = Breaths { ok: ok_low, present: present_low, ..br.clone() };
+    // only what the confident tier lacks
+    let fl: Vec<f64> = fv.iter().zip(an::fused_rate(&lc).1).map(|(v, l)| if v.is_nan() { l } else { f64::NAN }).collect();
     let s0 = a as f64 / FS;
     let (lo, hi) = (n0 as f64 / FS, n1 as f64 / FS);
     let keep: Vec<usize> = (0..br.len()).filter(|&i| br.rise[i] + s0 >= lo && br.rise[i] + s0 < hi).collect();
@@ -277,10 +421,13 @@ fn analyse_chunk(tl: &Timeline, mot: &[bool], c0: f64) -> Chunk {
     let med = dsp::median(&br.x[core.clone()].iter().map(|v| v.abs()).collect::<Vec<_>>()) + 1e-12;
     Chunk {
         b: bb,
+        low: keep.iter().map(|&i| low[i]).collect(),
         ft: kf.iter().map(|&i| ft[i] + s0).collect(),
         fv: kf.iter().map(|&i| fv[i]).collect(),
+        fl: kf.iter().map(|&i| fl[i]).collect(),
         q: br.q[core.clone()].to_vec(),
         present: br.present[core.clone()].to_vec(),
+        present_low: lc.present[core.clone()].to_vec(),
         x: br.x[core].iter().map(|v| (v / med) as f32).collect(),
     }
 }
@@ -370,6 +517,10 @@ pub struct Epoch {
     pub regularity: f64,
     pub track_bpm: f64,
     pub good: bool,
+    /// the lower-confidence tier, on top of the fields above (never mixed into them)
+    pub low_pct: f64,
+    pub rate_low_bpm: f64,
+    pub breaths_low: usize,
 }
 
 fn epochs(n: &NightData, ep_s: f64) -> Vec<Epoch> {
@@ -386,6 +537,7 @@ fn epochs(n: &NightData, ep_s: f64) -> Vec<Epoch> {
         let d: Vec<f64> = (0..b.len().saturating_sub(1)).filter(|&i| cons[i] && m[i]).map(|i| b.ttot[i + 1] - b.ttot[i]).collect();
         let fm: Vec<usize> = (0..n.ft.len()).filter(|&i| n.ft[i] >= e0 && n.ft[i] < e1).collect();
         let f: Vec<f64> = fm.iter().map(|&i| n.fv[i]).filter(|v| v.is_finite()).collect();
+        let l: Vec<f64> = fm.iter().map(|&i| n.fl[i]).filter(|v| v.is_finite()).collect();
         let (s0, s1) = ((e0 * FS) as usize, ((e1.min(dur)) * FS) as usize);
         let s1 = s1.min(n.q.len());
         let span = (s1 - s0).max(1) as f64;
@@ -409,6 +561,9 @@ fn epochs(n: &NightData, ep_s: f64) -> Vec<Epoch> {
             regularity: if tk.is_empty() { nan } else { dsp::mean(&tk.iter().map(|&i| n.track.reg[i]).collect::<Vec<_>>()) },
             track_bpm: if tks.len() >= 4 { dsp::median(&tks) } else { nan },
             good: okm.len() >= GOOD_MIN && okm.len() as f64 >= GOOD_FRAC * m.iter().filter(|&&v| v).count() as f64,
+            low_pct: 100.0 * l.len() as f64 / fm.len().max(1) as f64,
+            rate_low_bpm: if l.len() >= LOW_MIN { dsp::median(&l) } else { nan },
+            breaths_low: (0..b.len()).filter(|&i| m[i] && n.low[i]).count(),
         });
         e0 += ep_s;
     }
@@ -585,6 +740,8 @@ pub struct StageRow {
     pub breath_bpm: f64,
     pub wearable: Option<(f64, f64)>,
     pub usable_pct: f64,
+    /// breaths usable in the lower-confidence tier only, % of the stage's breaths
+    pub low_pct: f64,
     pub rmssd: f64,
     pub moves_h: f64,
 }
@@ -628,6 +785,7 @@ fn compare(n: &NightData, r: &Reference) -> Comparison {
             breath_bpm: if kbo.is_empty() { f64::NAN } else { dsp::median(&kbo) },
             wearable: r.resp.iter().find(|x| x.0 == st).map(|x| (x.1, x.2)),
             usable_pct: 100.0 * kbo.len() as f64 / kb.len().max(1) as f64,
+            low_pct: 100.0 * kb.iter().filter(|&&i| n.low[i]).count() as f64 / kb.len().max(1) as f64,
             rmssd: if d.is_empty() { f64::NAN } else { dsp::mean(&d.iter().map(|v| v * v).collect::<Vec<_>>()).sqrt() },
             moves_h: se.iter().filter(|&&s| s == st).count() as f64 / (mins / 60.0),
         });
@@ -680,10 +838,15 @@ pub struct NightData {
     pub t0: f64,
     pub m: usize,
     pub b: Breaths,
+    /// per breath: usable in the lower-confidence tier only (irregular rhythm, but a real signal)
+    pub low: Vec<bool>,
     pub ft: Vec<f64>,
     pub fv: Vec<f64>,
+    /// lower-confidence rate on the ft grid, only where fv has no reading
+    pub fl: Vec<f64>,
     pub q: Vec<u8>,
     pub present: Vec<bool>,
+    pub present_low: Vec<bool>,
     pub x: Vec<f32>,
     pub events: Vec<(usize, usize, f64)>,
     pub motion_frac: f64,
@@ -723,23 +886,27 @@ pub fn analyse(dir: &Path, opt: &Options, log: &(dyn Fn(String) + Sync)) -> Resu
 fn analyse_inner(dir: &Path, opt: &Options, log: &(dyn Fn(String) + Sync)) -> Result<NightData> {
     let tl = timeline(dir, log)?;
     log(format!("timeline: {}, {:.2} h, {} subcarriers", clock(tl.t0, "%H:%M:%S"), tl.n as f64 / FS / 3600.0, tl.m));
-    let (mot, events) = movement(&tl);
+    let (mot, events, uns) = movement(&tl);
     let motion_frac = mot.iter().filter(|&&v| v).count() as f64 / mot.len() as f64;
     log(format!("movement: {} events, {:.1}% of the night", events.len(), 100.0 * motion_frac));
     let starts: Vec<f64> = (0..).map(|i| i as f64 * CHUNK_S).take_while(|&c| c < tl.n as f64 / FS).collect();
     log(format!("analysing {} chunks of {} min ...", starts.len(), CHUNK_S as usize / 60));
     let t_ = std::time::Instant::now();
-    let chunks: Vec<Chunk> = starts.par_iter().map(|&c0| analyse_chunk(&tl, &mot, c0)).collect();
+    let chunks: Vec<Chunk> = starts.par_iter().map(|&c0| analyse_chunk(&tl, &mot, &uns, c0)).collect();
     log(format!("  analysed in {:.0} s", t_.elapsed().as_secs_f64()));
     let mut b = Breaths::default();
     let (mut ft, mut fv, mut q, mut present, mut x) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut low, mut fl, mut present_low) = (vec![], vec![], vec![]);
     for c in chunks {
         macro_rules! ext { ($($f:ident),*) => { $( b.$f.extend(c.b.$f.iter().cloned()); )* } }
         ext!(tr, rise, pk, nxt, slope, ttot, ti, te, ti_frac, depth, ok, why);
+        low.extend(c.low);
         ft.extend(c.ft);
         fv.extend(c.fv);
+        fl.extend(c.fl);
         q.extend(c.q);
         present.extend(c.present);
+        present_low.extend(c.present_low);
         x.extend(c.x);
     }
     let t0 = tl.t0;
@@ -751,10 +918,13 @@ fn analyse_inner(dir: &Path, opt: &Options, log: &(dyn Fn(String) + Sync)) -> Re
         t0,
         m,
         b,
+        low,
         ft,
         fv,
+        fl,
         q,
         present,
+        present_low,
         x,
         events,
         motion_frac,
@@ -797,11 +967,11 @@ fn f3(v: f64) -> String {
 
 fn write_outputs(n: &NightData) -> Result<()> {
     let b = &n.b;
-    let mut s = String::from("clock,onset_s,bpm,ttot_s,ti_s,te_s,ti_frac,depth,ok,why\r\n");
+    let mut s = String::from("clock,onset_s,bpm,ttot_s,ti_s,te_s,ti_frac,depth,ok,why,low_conf\r\n");
     for i in 0..b.len() {
         let _ = write!(
             s,
-            "{},{:.2},{:.1},{:.2},{:.2},{:.2},{},{:.3},{},{}\r\n",
+            "{},{:.2},{:.1},{:.2},{:.2},{:.2},{},{:.3},{},{},{}\r\n",
             clock(n.t0 + b.rise[i], "%H:%M:%S"),
             b.rise[i],
             60.0 / b.ttot[i],
@@ -811,15 +981,16 @@ fn write_outputs(n: &NightData) -> Result<()> {
             an::nf(b.ti_frac[i], 0, 2),
             b.depth[i],
             b.ok[i] as u8,
-            b.why[i]
+            b.why[i],
+            n.low[i] as u8
         );
     }
     std::fs::write(n.dir.join("night-breaths.csv"), s)?;
-    let mut s = String::from("start,t_h,rate_bpm,breath_bpm,cv_pct,rmssd_s,ti_frac,breaths_ok,breaths,reading_pct,present_pct,motion_pct,movements,regularity,track_bpm,good\r\n");
+    let mut s = String::from("start,t_h,rate_bpm,breath_bpm,cv_pct,rmssd_s,ti_frac,breaths_ok,breaths,reading_pct,present_pct,motion_pct,movements,regularity,track_bpm,good,low_pct,rate_low_bpm,breaths_low\r\n");
     for e in &n.epochs {
         let _ = write!(
             s,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
             e.start,
             f3(e.t_h),
             f3(e.rate_bpm),
@@ -835,7 +1006,10 @@ fn write_outputs(n: &NightData) -> Result<()> {
             e.movements,
             f3(e.regularity),
             f3(e.track_bpm),
-            e.good as u8
+            e.good as u8,
+            f3(e.low_pct),
+            f3(e.rate_low_bpm),
+            e.breaths_low
         );
     }
     std::fs::write(n.dir.join("night-epochs.csv"), s)?;
@@ -890,6 +1064,21 @@ pub fn summary(n: &NightData) -> String {
         100.0 * n.q.iter().filter(|&&v| v == 1).count() as f64 / nq,
         100.0 * n.q.iter().filter(|&&v| v == 2).count() as f64 / nq
     );
+    let lown = n.low.iter().filter(|&&v| v).count();
+    let finl: Vec<f64> = n.fl.iter().copied().filter(|v| v.is_finite()).collect();
+    if lown > 0 && !finl.is_empty() {
+        let _ = writeln!(
+            o,
+            "lower confidence (a real signal, but no single clear rhythm: REM, awake): {} more breaths ({:.0}%), a reading {:.0}% more of the time (present {:.0}%), median {:.1} BPM (5-95%: {:.1}-{:.1})",
+            lown,
+            100.0 * lown as f64 / b.len().max(1) as f64,
+            100.0 * finl.len() as f64 / n.fv.len() as f64,
+            100.0 * n.present_low.iter().filter(|&&v| v).count() as f64 / nq,
+            dsp::median(&finl),
+            dsp::percentile(&finl, 5.0),
+            dsp::percentile(&finl, 95.0)
+        );
+    }
     let cons = consecutive(b);
     let d: Vec<f64> = (0..b.len().saturating_sub(1)).filter(|&i| cons[i]).map(|i| b.ttot[i + 1] - b.ttot[i]).collect();
     let tto: Vec<f64> = (0..b.len()).filter(|&i| b.ok[i]).map(|i| b.ttot[i]).collect();
@@ -955,13 +1144,13 @@ pub fn summary(n: &NightData) -> String {
     if let Some(c) = &n.comparison {
         let _ = writeln!(
             o,
-            "\nWiFi metrics per reference stage:\n  {:6} {:>5} {:>10} {:>8} {:>10} {:>13} {:>8} {:>8} {:>8}",
-            "stage", "min", "regularity", "steady%", "breath BPM", "wearable BPM", "usable%", "RMSSD s", "moves/h"
+            "\nWiFi metrics per reference stage:\n  {:6} {:>5} {:>10} {:>8} {:>10} {:>13} {:>8} {:>9} {:>8} {:>8}",
+            "stage", "min", "regularity", "steady%", "breath BPM", "wearable BPM", "usable%", "+lowconf%", "RMSSD s", "moves/h"
         );
         for r in &c.rows {
             let _ = writeln!(
                 o,
-                "  {:6} {:5.0} {:10.2} {:8.0} {} {:>13} {:8.0} {} {:8.1}",
+                "  {:6} {:5.0} {:10.2} {:8.0} {} {:>13} {:8.0} {:9.0} {} {:8.1}",
                 r.stage,
                 r.minutes,
                 r.regularity,
@@ -969,6 +1158,7 @@ pub fn summary(n: &NightData) -> String {
                 an::nf(r.breath_bpm, 10, 1),
                 r.wearable.map(|w| format!("{:.1} +-{:.1}", w.0, w.1)).unwrap_or_else(|| "-".into()),
                 r.usable_pct,
+                r.low_pct,
                 an::nf(r.rmssd, 8, 2),
                 r.moves_h
             );

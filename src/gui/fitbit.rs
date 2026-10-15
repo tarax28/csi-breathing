@@ -100,7 +100,7 @@ impl FitbitPage {
             theme::small(ui, "While the Cloud app is in Testing, Google ends the login after 7 days: then log in again.");
             ui.add_space(10.0);
             let idle = self.action.is_none();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if theme::secondary(ui, "Choose credentials.json ...", idle).clicked() {
                     if let Some(f) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_directory(dirs::download_dir().unwrap_or_default()).pick_file() {
                         self.msg = Some(match health::install_credentials(&f) {
@@ -127,7 +127,7 @@ impl FitbitPage {
         ui.add_space(20.0);
         theme::h2(ui, "Sleep for a night");
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Night ending on").color(p.text2));
             if ui.button("◀").on_hover_text("Previous day").clicked() {
                 self.date -= CDuration::days(1);

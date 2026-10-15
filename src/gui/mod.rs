@@ -94,7 +94,20 @@ pub struct Settings {
     pub keep_awake: bool,
     pub screen_off: bool,
     pub epoch_min: u32,
+    /// interface size in %, one of UI_SCALES (Ctrl + / Ctrl - / Ctrl 0)
+    pub ui_scale: u32,
+    /// scale the interface down further when the window is narrower than FIT_W
+    pub fit_narrow: bool,
 }
+
+/// The interface sizes on offer, in %.
+pub const UI_SCALES: [u32; 7] = [80, 90, 100, 110, 125, 150, 175];
+/// Below this width (points) the sidebar of pages becomes a bar across the top.
+const COMPACT_W: f32 = 1040.0;
+/// The narrowest width (points) the pages are laid out for: in a narrower window everything is
+/// drawn smaller instead (down to FIT_MIN), so a narrow tile still shows whole charts.
+const FIT_W: f32 = 620.0;
+const FIT_MIN: f32 = 0.6;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -111,6 +124,8 @@ impl Default for Settings {
             keep_awake: true,
             screen_off: true,
             epoch_min: 5,
+            ui_scale: 100,
+            fit_narrow: true,
         }
     }
 }
@@ -149,6 +164,16 @@ pub enum Page {
     Boards,
     Tools,
 }
+
+/// (page, name in the sidebar, name in the top bar, what it is for)
+const PAGES: [(Page, &str, &str, &str); 6] = [
+    (Page::Breath, "Breath test", "Breath test", "tap along, compare"),
+    (Page::Record, "Night recording", "Recording", "record while you sleep"),
+    (Page::Nights, "Nights", "Nights", "analyse a recorded night"),
+    (Page::Fitbit, "Fitbit", "Fitbit", "sleep stages to compare"),
+    (Page::Boards, "Boards", "Boards", "find, check, flash"),
+    (Page::Tools, "Tools", "Tools", "replay, selftest, settings"),
+];
 
 pub struct Shared {
     pub set: Settings,
@@ -222,6 +247,8 @@ pub struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup(&cc.egui_ctx);
+        // the app sets the zoom itself (Settings::ui_scale and the fit to a narrow window)
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let mut set: Settings = cc.storage.and_then(|s| eframe::get_value(s, "settings")).unwrap_or_default();
         set.results = match (std::env::var_os("CSI_RESULTS"), &set.results_custom) {
             (Some(p), _) => PathBuf::from(p),
@@ -297,16 +324,28 @@ impl eframe::App for App {
         if let Some(p) = self.sh.goto.take() {
             self.page = p;
         }
+        self.rescale(&ctx);
         let p = pal(ui);
-        egui::Panel::left("nav")
-            .exact_size(216.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.side).inner_margin(Margin { left: 14, right: 14, top: 22, bottom: 16 }))
-            .show(ui, |ui| self.sidebar(ui));
+        let compact = ui.available_width() < COMPACT_W;
+        if compact {
+            egui::Panel::top("nav-top")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(p.side).inner_margin(Margin { left: 16, right: 16, top: 8, bottom: 8 }))
+                .show(ui, |ui| self.topbar(ui));
+        } else {
+            egui::Panel::left("nav")
+                .exact_size(216.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(p.side).inner_margin(Margin { left: 14, right: 14, top: 22, bottom: 16 }))
+                .show(ui, |ui| self.sidebar(ui));
+        }
+        let margin = if compact { Margin { left: 20, right: 20, top: 18, bottom: 24 } } else { Margin { left: 36, right: 36, top: 26, bottom: 32 } };
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt(("page", self.page as u8)).auto_shrink([false, false]).show(ui, |ui| {
-                egui::Frame::new().inner_margin(Margin { left: 36, right: 36, top: 26, bottom: 32 }).show(ui, |ui| {
+            // the pages fit the width; the sideways scroll is only there so that nothing is ever out of reach
+            egui::ScrollArea::both().id_salt(("page", self.page as u8)).auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
                     let w = ui.available_width().min(1320.0);
                     ui.set_max_width(w);
                     match self.page {
@@ -324,6 +363,69 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The interface size: the user's choice (Settings, Ctrl + / Ctrl - / Ctrl 0), times a fit
+    /// factor when the window is narrower than the pages are laid out for.
+    fn rescale(&mut self, ctx: &egui::Context) {
+        use egui::gui_zoom::kb_shortcuts as keys;
+        let (up, down, reset) = ctx.input_mut(|i| {
+            (i.consume_shortcut(&keys::ZOOM_IN) || i.consume_shortcut(&keys::ZOOM_IN_SECONDARY), i.consume_shortcut(&keys::ZOOM_OUT), i.consume_shortcut(&keys::ZOOM_RESET))
+        });
+        let set = &mut self.sh.set;
+        let at = UI_SCALES.iter().position(|&s| s >= set.ui_scale).unwrap_or(UI_SCALES.len() - 1);
+        if up {
+            set.ui_scale = UI_SCALES[(at + 1).min(UI_SCALES.len() - 1)];
+        } else if down {
+            set.ui_scale = UI_SCALES[at.saturating_sub(1)];
+        } else if reset {
+            set.ui_scale = 100;
+        }
+        let user = set.ui_scale.clamp(UI_SCALES[0], UI_SCALES[UI_SCALES.len() - 1]) as f32 / 100.0;
+        // the window width in points at size 100 %: the same whatever the zoom is right now
+        let native_w = ctx.content_rect().width() * ctx.zoom_factor();
+        // in steps of 5 %, so that dragging the window edge does not re-render the fonts at every pixel
+        let fit = if set.fit_narrow { ((native_w / (FIT_W * user) * 20.0).floor() / 20.0).clamp(FIT_MIN, 1.0) } else { 1.0 };
+        if (ctx.zoom_factor() - user * fit).abs() > 1e-3 {
+            ctx.set_zoom_factor(user * fit);
+        }
+    }
+
+    /// The pages and the board state as a bar across the top, for a window too narrow for the sidebar.
+    fn topbar(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            breath_mark(ui, p.accent);
+            ui.add_space(4.0);
+            for (pg, _, name, sub) in PAGES {
+                let on = self.page == pg;
+                let text = RichText::new(name).font(FontId::new(14.0, if on { theme::medium() } else { egui::FontFamily::Proportional })).color(p.text);
+                let b = egui::Button::new(text)
+                    .fill(if on { p.panel } else { egui::Color32::TRANSPARENT })
+                    .stroke(if on { Stroke::new(1.0, p.border) } else { Stroke::NONE })
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(0.0, 32.0));
+                if ui.add(b).on_hover_text(sub).clicked() {
+                    self.page = pg;
+                }
+            }
+            ui.add_space(10.0);
+            ui.spacing_mut().item_spacing.x = 12.0;
+            if let Some(r) = &self.sh.replay {
+                theme::chip(ui, Level::Warn, "Replay", 32.0).on_hover_text(format!("Replaying {}", r.file_name().unwrap_or_default().to_string_lossy()));
+            }
+            if self.sh.recording {
+                let st = if self.sh.record_status.is_empty() { "Recording a night".to_string() } else { self.sh.record_status.clone() };
+                if theme::chip(ui, Level::Good, "Recording", 32.0).on_hover_text(st).clicked() {
+                    self.page = Page::Record;
+                }
+            }
+            let rx = self.sh.rx().map(|p| p.name.clone());
+            let tx = self.sh.tx().map(|p| p.name.clone());
+            theme::chip(ui, if rx.is_some() { Level::Good } else { Level::Off }, "RX", 32.0).on_hover_text(format!("RX {}", rx.unwrap_or_else(|| "not plugged in".into())));
+            theme::chip(ui, if tx.is_some() { Level::Good } else { Level::Off }, "TX", 32.0).on_hover_text(format!("TX {}", tx.unwrap_or_else(|| "not on USB".into())));
+        });
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui);
         ui.horizontal(|ui| {
@@ -332,15 +434,7 @@ impl App {
             ui.label(RichText::new("CSI breathing").font(FontId::new(17.0, theme::medium())).color(p.text));
         });
         ui.add_space(22.0);
-        let items = [
-            (Page::Breath, "Breath test", "tap along, compare"),
-            (Page::Record, "Night recording", "record while you sleep"),
-            (Page::Nights, "Nights", "analyse a recorded night"),
-            (Page::Fitbit, "Fitbit", "sleep stages to compare"),
-            (Page::Boards, "Boards", "find, check, flash"),
-            (Page::Tools, "Tools", "replay, selftest, settings"),
-        ];
-        for (pg, name, sub) in items {
+        for (pg, name, _, sub) in PAGES {
             let on = self.page == pg;
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), egui::Sense::click());
             let fill = if on {
@@ -422,7 +516,12 @@ pub fn run() -> eframe::Result<()> {
         }
         egui::IconData { rgba, width: n as u32, height: n as u32 }
     };
+    // a scripted screenshot run keeps its own state: it must not open in the window state the
+    // user left the app in, nor overwrite it
+    let demo = std::env::var_os("CSI_DEMO").is_some();
     let opts = eframe::NativeOptions {
+        persist_window: !demo,
+        persistence_path: demo.then(|| std::env::temp_dir().join("csi-breathing-demo.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_title("CSI breathing")
             .with_app_id("csi-breathing")
@@ -435,7 +534,7 @@ pub fn run() -> eframe::Result<()> {
                     })
                     .unwrap_or([1340.0, 900.0]),
             )
-            .with_min_inner_size([900.0, 600.0])
+            .with_min_inner_size([420.0, 360.0])
             .with_icon(icon),
         // With vsync the GL swap waits for the compositor's frame callback, which never comes while the
         // window is on a hidden workspace: the app then stops answering and is marked "not responding".

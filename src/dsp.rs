@@ -185,8 +185,11 @@ impl Psd {
         Psd { nperseg, nfft, win, scale, fft, buf: vec![C64::new(0.0, 0.0); nfft] }
     }
 
+    /// numpy.fft.rfftfreq(nfft, 1 / fs), with the same rounding: a bin that sits on a band edge
+    /// (0.6 Hz with a 20 s segment) must fall on the same side of it as in the Python.
     pub fn freqs(&self, fs: f64) -> Vec<f64> {
-        (0..self.nfft / 2 + 1).map(|i| i as f64 * fs / self.nfft as f64).collect()
+        let val = 1.0 / (self.nfft as f64 * (1.0 / fs));
+        (0..self.nfft / 2 + 1).map(|i| i as f64 * val).collect()
     }
 
     /// One-sided density periodogram of one segment (mean removed), added into `acc`.

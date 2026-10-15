@@ -199,19 +199,31 @@ pub fn small(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     ui.label(RichText::new(text.into()).size(12.0).color(c))
 }
 
-/// A number with its unit and a caption under it.
+/// A number with its unit and a caption under it. One widget of a known size, so a wrapping row
+/// of them moves a whole stat to the next line instead of squeezing it at the edge.
 pub fn stat(ui: &mut egui::Ui, value: &str, unit: &str, caption: &str) {
     let p = pal(ui);
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            ui.label(RichText::new(value).font(FontId::new(24.0, medium())).color(p.text));
-            if !unit.is_empty() && value != "–" {
-                ui.label(RichText::new(unit).size(13.0).color(p.text2));
-            }
-        });
-        ui.label(RichText::new(caption).size(12.0).color(p.text2));
+    let pt = ui.painter().clone();
+    let val = pt.layout_no_wrap(value.to_string(), FontId::new(24.0, medium()), p.text);
+    let unit = (!unit.is_empty() && value != "–").then(|| pt.layout_no_wrap(unit.to_string(), FontId::proportional(13.0), p.text2));
+    let cap = pt.layout_no_wrap(caption.to_string(), FontId::proportional(12.0), p.text2);
+    let top = val.size().x + unit.as_ref().map_or(0.0, |u| 3.0 + u.size().x);
+    let (r, _) = ui.allocate_exact_size(Vec2::new(top.max(cap.size().x), val.size().y + cap.size().y), egui::Sense::hover());
+    let (vw, vh) = (val.size().x, val.size().y);
+    pt.galley(r.min, val, p.text);
+    if let Some(u) = unit {
+        pt.galley(r.min + Vec2::new(vw + 3.0, (vh - u.size().y) / 2.0), u, p.text2);
+    }
+    pt.galley(r.min + Vec2::new(0.0, vh), cap, p.text2);
+}
+
+/// A settings row: its name in a fixed column, then the controls, which wrap in a narrow window.
+pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let p = pal(ui);
+    ui.horizontal_top(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(120.0, ui.spacing().interact_size.y), egui::Sense::hover());
+        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), p.text2);
+        ui.vertical(|ui| ui.horizontal_wrapped(add));
     });
 }
 
@@ -251,6 +263,20 @@ pub fn status(ui: &mut egui::Ui, l: Level, text: impl Into<String>) -> egui::Res
         ui.add(egui::Label::new(RichText::new(text.into()).color(p.text)).wrap());
     })
     .response
+}
+
+/// A status in a word, for tight places: the coloured icon and a short label, as one widget
+/// `height` tall (so it lines up with the buttons beside it).
+pub fn chip(ui: &mut egui::Ui, l: Level, text: &str, height: f32) -> egui::Response {
+    let p = pal(ui);
+    let pt = ui.painter().clone();
+    let icon = pt.layout_no_wrap(level_icon(l).to_string(), FontId::proportional(13.0), level_color(&p, l));
+    let label = pt.layout_no_wrap(text.to_string(), FontId::proportional(12.5), p.text2);
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(icon.size().x + 5.0 + label.size().x, height), egui::Sense::click());
+    let iw = icon.size().x;
+    pt.galley(egui::pos2(r.left(), r.center().y - icon.size().y / 2.0), icon, p.text2);
+    pt.galley(egui::pos2(r.left() + iw + 5.0, r.center().y - label.size().y / 2.0), label, p.text2);
+    resp
 }
 
 // ----------------------------------------------------------------- containers and buttons

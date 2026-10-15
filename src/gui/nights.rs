@@ -22,6 +22,23 @@ struct Item {
     fitbit: bool,
 }
 
+impl Item {
+    fn span(&self) -> String {
+        let hrs = self.hours.map(|h| format!("{h:.1} h")).unwrap_or_else(|| format!("{} parts", self.parts));
+        format!("from {}, {hrs}", self.start)
+    }
+    fn done(&self) -> bool {
+        self.view || self.analysed
+    }
+    fn tag(&self) -> &'static str {
+        match (self.done(), self.fitbit) {
+            (true, true) => "analysed, Fitbit",
+            (true, false) => "analysed",
+            _ => "not analysed",
+        }
+    }
+}
+
 fn scan(results: &Path) -> Vec<Item> {
     night::list_nights(results)
         .into_iter()
@@ -141,6 +158,13 @@ impl NightsPage {
         theme::note(ui, "Breathing through the night as the WiFi measured it, next to the sleep stages from your Fitbit.");
         ui.add_space(18.0);
         let side = 250.0;
+        if ui.available_width() < 900.0 {
+            // too narrow for the list beside the charts: the nights become a drop-down above them
+            self.picker_ui(ui, sh);
+            ui.add_space(12.0);
+            self.main_ui(ui, sh);
+            return;
+        }
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(Vec2::new(side, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(side);
@@ -153,6 +177,32 @@ impl NightsPage {
                 self.main_ui(ui, sh)
             });
         });
+    }
+
+    fn picker_ui(&mut self, ui: &mut egui::Ui, sh: &mut Shared) {
+        if self.items.is_empty() {
+            theme::note(ui, "No recorded nights yet. Start one on the Night recording page.");
+            return;
+        }
+        let label = |it: &Item| format!("{}, {}  ·  {}", it.day, it.span(), it.tag());
+        let cur = self.sel.as_ref().and_then(|s| self.items.iter().find(|i| &i.dir == s)).map(label).unwrap_or_else(|| "Pick a night".into());
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("night-pick").selected_text(cur).width((ui.available_width() - 190.0).clamp(240.0, 440.0)).show_ui(ui, |ui| {
+                for it in &self.items {
+                    if ui.selectable_label(self.sel.as_ref() == Some(&it.dir), label(it)).clicked() {
+                        pick = Some(it.dir.clone());
+                    }
+                }
+            });
+            if theme::secondary(ui, "Open results folder", true).clicked() {
+                let _ = open::that(sh.results());
+            }
+        });
+        if let Some(d) = pick {
+            self.sel = Some(d);
+            self.error = None;
+        }
     }
 
     fn list_ui(&mut self, ui: &mut egui::Ui, sh: &mut Shared) {
@@ -177,10 +227,8 @@ impl NightsPage {
             ui.painter().rect_filled(rect, 6.0, fill);
             let pt = ui.painter();
             pt.text(rect.left_top() + Vec2::new(10.0, 7.0), egui::Align2::LEFT_TOP, &it.day, egui::FontId::new(14.0, theme::medium()), p.text);
-            let hrs = it.hours.map(|h| format!("{h:.1} h")).unwrap_or_else(|| format!("{} parts", it.parts));
-            pt.text(rect.left_top() + Vec2::new(10.0, 28.0), egui::Align2::LEFT_TOP, format!("from {}, {hrs}", it.start), egui::FontId::proportional(12.0), p.text2);
-            let tag = if it.view || it.analysed { if it.fitbit { "analysed, Fitbit" } else { "analysed" } } else { "not analysed" };
-            pt.text(rect.right_top() + Vec2::new(-10.0, 9.0), egui::Align2::RIGHT_TOP, tag, egui::FontId::proportional(11.5), if it.view || it.analysed { p.text2 } else { p.muted });
+            pt.text(rect.left_top() + Vec2::new(10.0, 28.0), egui::Align2::LEFT_TOP, it.span(), egui::FontId::proportional(12.0), p.text2);
+            pt.text(rect.right_top() + Vec2::new(-10.0, 9.0), egui::Align2::RIGHT_TOP, it.tag(), egui::FontId::proportional(11.5), if it.done() { p.text2 } else { p.muted });
             if resp.clicked() {
                 pick = Some(it.dir.clone());
             }
@@ -321,6 +369,9 @@ fn night_ui(ui: &mut egui::Ui, v: &NightView, tex: egui::TextureId, show_summary
         theme::stat(ui, &format!("{:.0}", v.steady_pct()), "%", "of the night breathing steadily");
         theme::stat(ui, &v.moves.len().to_string(), "", "movements");
         theme::stat(ui, &format!("{:.0}", 100.0 * v.breath_t.len() as f64 / v.breaths_total.max(1) as f64), "%", "of breaths usable");
+        if !v.low_t.is_empty() {
+            theme::stat(ui, &format!("+{:.0}", 100.0 * v.low_t.len() as f64 / v.breaths_total.max(1) as f64), "%", "more at lower confidence");
+        }
         if let Some((fit, wifi)) = v.whole {
             theme::stat(ui, &format!("{wifi:.1} / {fit:.1}"), "BPM", "WiFi / Fitbit, whole night");
         }
@@ -336,9 +387,7 @@ fn night_ui(ui: &mut egui::Ui, v: &NightView, tex: egui::TextureId, show_summary
             .default_x_bounds(xmin, xmax)
     };
     theme::panel(ui, |ui| {
-        ui.horizontal(|ui| {
-            theme::small(ui, "Drag or scroll with Ctrl to zoom the time axis; all charts follow. Double-click to reset.");
-        });
+        theme::small(ui, "Drag or scroll with Ctrl to zoom the time axis; all charts follow. Double-click to reset.");
         if !v.stages.is_empty() || !v.moves.is_empty() {
             charts::heading(
                 ui,
@@ -418,8 +467,20 @@ fn night_ui(ui: &mut egui::Ui, v: &NightView, tex: egui::TextureId, show_summary
                 }
             });
 
-        charts::heading(ui, "Breathing rate", "every usable breath, and the median per epoch");
-        charts::key(ui, &[(faint(&p), "Single breaths", Mark::Dot), (p.cat[0], "Epoch median", Mark::Line)]);
+        // the lower-confidence tier is drawn in its own colour and never joins the main line
+        let has_low = !v.low_t.is_empty();
+        let lowc = p.cat[6];
+        charts::heading(
+            ui,
+            "Breathing rate",
+            if has_low { "every usable breath and the median per epoch; lower confidence = a real signal, but no single clear rhythm (REM, awake)" } else { "every usable breath, and the median per epoch" },
+        );
+        let mut k = vec![(faint(&p), "Single breaths", Mark::Dot), (p.cat[0], "Epoch median", Mark::Line)];
+        if has_low {
+            k.push((alpha(lowc, 150), "Breaths, lower confidence", Mark::Dot));
+            k.push((lowc, "Epoch median, lower confidence", Mark::Dashed));
+        }
+        charts::key(ui, &k);
         let ep_t: Vec<f64> = v.epochs.iter().map(|e| e.t + v.epoch_min * 30.0).collect();
         base("rate", 210.0)
             .y_axis_label("BPM")
@@ -427,6 +488,20 @@ fn night_ui(ui: &mut egui::Ui, v: &NightView, tex: egui::TextureId, show_summary
             .show(ui, |pu| {
                 let pts: Vec<[f64; 2]> = v.breath_t.iter().zip(&v.breath_bpm).filter(|(_, b)| **b < 40.0).map(|(t, b)| [*t, *b]).collect();
                 pu.points(Points::new("Single breaths", pts).color(faint(&p)).radius(1.3));
+                if has_low {
+                    let pts: Vec<[f64; 2]> = v.low_t.iter().zip(&v.low_bpm).filter(|(_, b)| **b < 40.0).map(|(t, b)| [*t, *b]).collect();
+                    pu.points(Points::new("Breaths, lower confidence", pts).color(alpha(lowc, if p.dark { 130 } else { 110 })).radius(1.3));
+                    // dashed, and each run reaches half an epoch past its ends: these readings come in
+                    // separate stretches, often a single epoch that a plain line would not show at all
+                    let h = v.epoch_min * 30.0;
+                    let rl: Vec<f64> = v.epochs.iter().map(|e| e.rate_low).collect();
+                    for (i, mut run) in charts::runs(&ep_t, &rl).into_iter().enumerate() {
+                        let (a, b) = (run[0], run[run.len() - 1]);
+                        run.insert(0, [a[0] - h, a[1]]);
+                        run.push([b[0] + h, b[1]]);
+                        pu.line(Line::new(if i == 0 { "Epoch median, lower confidence" } else { "" }, run).color(lowc).style(LineStyle::dashed_dense()).width(2.0));
+                    }
+                }
                 let r: Vec<f64> = v.epochs.iter().map(|e| e.rate).collect();
                 for (i, run) in charts::runs(&ep_t, &r).into_iter().enumerate() {
                     pu.line(Line::new(if i == 0 { "Epoch median" } else { "" }, run).color(p.cat[0]).width(2.2));
@@ -481,26 +556,64 @@ fn night_ui(ui: &mut egui::Ui, v: &NightView, tex: egui::TextureId, show_summary
         ui.add_space(6.0);
         theme::panel(ui, |ui| {
             let f = |x: f64, d: usize| if x.is_finite() { format!("{x:.d$}") } else { "–".into() };
-            egui::Grid::new("stages-table").striped(true).num_columns(9).spacing([22.0, 8.0]).min_col_width(40.0).show(ui, |ui| {
-                for h in ["Stage", "Minutes", "Regularity", "Steady", "WiFi rate", "Fitbit rate", "Usable breaths", "RMSSD", "Movements"] {
-                    ui.label(RichText::new(h).size(12.5).color(p.text2));
-                }
-                ui.end_row();
-                for r in &v.rows {
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 3.0, stage_color(&r.stage));
-                        ui.label(RichText::new(stage_name(&r.stage)).color(p.text));
+            let stage = |ui: &mut egui::Ui, s: &str| {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 3.0, stage_color(s));
+                    ui.label(RichText::new(stage_name(s)).color(p.text));
+                });
+            };
+            let head = |ui: &mut egui::Ui, h: &str| {
+                ui.label(RichText::new(h).size(12.5).color(p.text2));
+            };
+            type Cell = fn(&super::nightview::StageV, &dyn Fn(f64, usize) -> String) -> String;
+            // (heading, unit after the number in the wide table, heading with the unit for the narrow one, value)
+            let cols: [(&str, &str, &str, Cell); 9] = [
+                ("Minutes", "", "Minutes", |r, f| f(r.minutes, 0)),
+                ("Regularity", "", "Regularity", |r, f| f(r.regularity, 2)),
+                ("Steady", " %", "Steady, %", |r, f| f(r.steady_pct, 0)),
+                ("WiFi rate", " BPM", "WiFi rate, BPM", |r, f| f(r.breath_bpm, 1)),
+                ("Fitbit rate", " BPM", "Fitbit rate, BPM", |r, _| r.wearable.map(|w| format!("{:.1} ± {:.1}", w.0, w.1)).unwrap_or("–".into())),
+                ("Usable breaths", " %", "Usable breaths, %", |r, f| f(r.usable_pct, 0)),
+                ("Lower confidence", " %", "Lower confidence, + %", |r, f| format!("+{}", f(r.low_pct, 0))),
+                ("RMSSD", " s", "RMSSD, s", |r, f| f(r.rmssd, 2)),
+                ("Movements", " /h", "Movements per hour", |r, f| f(r.moves_h, 1)),
+            ];
+            let wide = ui.available_width() > 880.0;
+            // if even the narrow table does not fit, it scrolls sideways on its own
+            egui::ScrollArea::horizontal().id_salt("stages-scroll").show(ui, |ui| {
+                if wide {
+                    egui::Grid::new("stages-table").striped(true).num_columns(10).spacing([22.0, 8.0]).min_col_width(40.0).show(ui, |ui| {
+                        head(ui, "Stage");
+                        for c in &cols {
+                            head(ui, c.0);
+                        }
+                        ui.end_row();
+                        for r in &v.rows {
+                            stage(ui, &r.stage);
+                            for c in &cols {
+                                let val = c.3(r, &f);
+                                ui.label(if val == "–" { val } else { format!("{val}{}", c.1) });
+                            }
+                            ui.end_row();
+                        }
                     });
-                    ui.label(f(r.minutes, 0));
-                    ui.label(f(r.regularity, 2));
-                    ui.label(format!("{} %", f(r.steady_pct, 0)));
-                    ui.label(format!("{} BPM", f(r.breath_bpm, 1)));
-                    ui.label(r.wearable.map(|w| format!("{:.1} ± {:.1} BPM", w.0, w.1)).unwrap_or("–".into()));
-                    ui.label(format!("{} %", f(r.usable_pct, 0)));
-                    ui.label(format!("{} s", f(r.rmssd, 2)));
-                    ui.label(format!("{} /h", f(r.moves_h, 1)));
-                    ui.end_row();
+                } else {
+                    // one column per stage: four short columns fit where ten do not
+                    egui::Grid::new("stages-table-narrow").striped(true).num_columns(v.rows.len() + 1).spacing([18.0, 8.0]).min_col_width(40.0).show(ui, |ui| {
+                        head(ui, "");
+                        for r in &v.rows {
+                            stage(ui, &r.stage);
+                        }
+                        ui.end_row();
+                        for c in &cols {
+                            head(ui, c.2);
+                            for r in &v.rows {
+                                ui.label(c.3(r, &f));
+                            }
+                            ui.end_row();
+                        }
+                    });
                 }
             });
             if let Some((d, pv)) = &v.deep_minus_rem {

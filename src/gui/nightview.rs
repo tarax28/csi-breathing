@@ -6,33 +6,62 @@ use crate::night::{self, NightData, REG_MIN};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 
 pub const FILE: &str = "night-view.json.gz";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+// JSON has no NaN: serde_json writes a missing value as null, and these read it back
+fn nan<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+}
+
+fn nans<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+    Ok(Vec::<Option<f64>>::deserialize(d)?.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect())
+}
+
+fn nan_pair<'de, D: Deserializer<'de>>(d: D) -> Result<Option<(f64, f64)>, D::Error> {
+    Ok(Option::<(Option<f64>, Option<f64>)>::deserialize(d)?.map(|(a, b)| (a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))))
+}
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct EpochV {
     pub t: f64,
+    #[serde(deserialize_with = "nan")]
     pub rate: f64,
+    #[serde(deserialize_with = "nan")]
     pub cv: f64,
+    #[serde(deserialize_with = "nan")]
     pub rmssd: f64,
+    #[serde(deserialize_with = "nan")]
     pub regularity: f64,
+    #[serde(deserialize_with = "nan")]
     pub motion_pct: f64,
     pub good: bool,
+    /// lower-confidence tier: median rate where the confident tier has no reading
+    #[serde(deserialize_with = "nan")]
+    pub rate_low: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct StageV {
     pub stage: String,
     pub minutes: f64,
+    #[serde(deserialize_with = "nan")]
     pub regularity: f64,
+    #[serde(deserialize_with = "nan")]
     pub steady_pct: f64,
+    #[serde(deserialize_with = "nan")]
     pub breath_bpm: f64,
+    #[serde(deserialize_with = "nan_pair")]
     pub wearable: Option<(f64, f64)>,
     pub usable_pct: f64,
+    /// breaths usable in the lower-confidence tier only, % of the stage's breaths
+    pub low_pct: f64,
+    #[serde(deserialize_with = "nan")]
     pub rmssd: f64,
+    #[serde(deserialize_with = "nan")]
     pub moves_h: f64,
 }
 
@@ -46,8 +75,16 @@ pub struct NightView {
     pub breath_t: Vec<f64>,
     pub breath_bpm: Vec<f64>,
     pub breaths_total: usize,
+    /// lower-confidence breaths (a real signal, but no single clear rhythm): onset and rate
+    pub low_t: Vec<f64>,
+    pub low_bpm: Vec<f64>,
+    /// % of the night with a rate reading, and what the lower-confidence tier adds to it
+    pub reading_pct: f64,
+    pub low_reading_pct: f64,
     pub track_t: Vec<f64>,
+    #[serde(deserialize_with = "nans")]
     pub track_bpm: Vec<f64>,
+    #[serde(deserialize_with = "nans")]
     pub reg2: Vec<f64>,
     /// spectrogram, column-major (time x bpm), 0..255, each column scaled to its peak
     pub spec: Vec<u8>,
@@ -63,6 +100,7 @@ pub struct NightView {
     pub restless: Vec<f64>,
     pub source: String,
     pub rows: Vec<StageV>,
+    #[serde(deserialize_with = "nan_pair")]
     pub whole: Option<(f64, f64)>,
     pub deep_minus_rem: Option<(f64, String)>,
     pub restless_hits: Vec<(u32, f64, usize, f64)>,
@@ -73,6 +111,8 @@ impl NightView {
     pub fn from(n: &NightData) -> Self {
         let b = &n.b;
         let ok: Vec<usize> = (0..b.len()).filter(|&i| b.ok[i]).collect();
+        let low: Vec<usize> = (0..b.len()).filter(|&i| n.low[i]).collect();
+        let share = |v: &[f64]| 100.0 * v.iter().filter(|x| x.is_finite()).count() as f64 / v.len().max(1) as f64;
         let tr = &n.track;
         let nb = tr.spec_bpm.len();
         let nt = tr.spec.len();
@@ -105,6 +145,10 @@ impl NightView {
             breath_t: ok.iter().map(|&i| b.rise[i]).collect(),
             breath_bpm: ok.iter().map(|&i| 60.0 / b.ttot[i]).collect(),
             breaths_total: b.len(),
+            low_t: low.iter().map(|&i| b.rise[i]).collect(),
+            low_bpm: low.iter().map(|&i| 60.0 / b.ttot[i]).collect(),
+            reading_pct: share(&n.fv),
+            low_reading_pct: share(&n.fl),
             track_t: tr.t.clone(),
             track_bpm: tr.bpm.clone(),
             reg2: tr.reg2.clone(),
@@ -115,7 +159,16 @@ impl NightView {
             epochs: n
                 .epochs
                 .iter()
-                .map(|e| EpochV { t: e.t_h * 3600.0, rate: e.rate_bpm, cv: e.cv_pct, rmssd: e.rmssd_s, regularity: e.regularity, motion_pct: e.motion_pct, good: e.good })
+                .map(|e| EpochV {
+                    t: e.t_h * 3600.0,
+                    rate: e.rate_bpm,
+                    cv: e.cv_pct,
+                    rmssd: e.rmssd_s,
+                    regularity: e.regularity,
+                    motion_pct: e.motion_pct,
+                    good: e.good,
+                    rate_low: e.rate_low_bpm,
+                })
                 .collect(),
             moves: n.events.iter().map(|e| (e.0 as f64, e.1 as f64)).collect(),
             motion_frac: n.motion_frac,
@@ -134,6 +187,7 @@ impl NightView {
                             breath_bpm: r.breath_bpm,
                             wearable: r.wearable,
                             usable_pct: r.usable_pct,
+                            low_pct: r.low_pct,
                             rmssd: r.rmssd,
                             moves_h: r.moves_h,
                         })
@@ -175,5 +229,31 @@ impl NightView {
             night::clock(self.t0, "%a %-d %b, %H:%M"),
             night::clock(self.t0 + self.dur, if self.dur > 20.0 * 3600.0 { "%a %H:%M" } else { "%H:%M" })
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_values_survive_the_cache() {
+        let dir = std::env::temp_dir().join(format!("csi-nightview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = NightView {
+            version: VERSION,
+            epochs: vec![EpochV { rate: 14.5, cv: f64::NAN, rate_low: f64::NAN, ..Default::default() }],
+            track_bpm: vec![15.0, f64::NAN],
+            whole: Some((16.0, f64::NAN)),
+            ..Default::default()
+        };
+        v.save(&dir).unwrap();
+        let back = NightView::load(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        let back = back.expect("a cached view with a missing value must load");
+        assert_eq!(back.epochs[0].rate, 14.5);
+        assert!(back.epochs[0].cv.is_nan() && back.epochs[0].rate_low.is_nan());
+        assert!(back.track_bpm[0] == 15.0 && back.track_bpm[1].is_nan());
+        assert!(back.whole.is_some_and(|w| w.0 == 16.0 && w.1.is_nan()));
     }
 }

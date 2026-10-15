@@ -35,9 +35,11 @@ pub fn key(ui: &mut egui::Ui, items: &[(Color32, &str, Mark)]) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 16.0;
         for (c, label, m) in items {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 12.0), egui::Sense::hover());
+            // one widget per key (mark + label), so a key that does not fit moves to the next line whole
+            let text = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(12.5), p.text2);
+            let (all, _) = ui.allocate_exact_size(egui::vec2(24.0 + text.size().x, text.size().y.max(12.0)), egui::Sense::hover());
+            {
+                let r = egui::Rect::from_min_size(egui::pos2(all.left(), all.center().y - 6.0), egui::vec2(18.0, 12.0));
                 let pt = ui.painter();
                 let cy = r.center().y;
                 match m {
@@ -69,8 +71,8 @@ pub fn key(ui: &mut egui::Ui, items: &[(Color32, &str, Mark)]) {
                         ));
                     }
                 }
-                ui.label(RichText::new(*label).size(12.5).color(p.text2));
-            });
+                pt.galley(egui::pos2(all.left() + 24.0, all.center().y - text.size().y / 2.0), text, p.text2);
+            }
         }
     });
 }

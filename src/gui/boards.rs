@@ -128,7 +128,7 @@ impl BoardsPage {
             card(self, ui, sh, "RX");
         }
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::secondary(ui, "Flash both", !busy && sh.tx().is_some() && sh.rx().is_some()).clicked() {
                 self.start_flash(ui.ctx(), sh, &["TX", "RX"]);
             }
@@ -147,7 +147,7 @@ impl BoardsPage {
         theme::h2(ui, "Link check");
         theme::small(ui, "Listens to the RX: packet rate, loss, gain lock and a frozen CSI buffer.");
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(egui::Slider::new(&mut sh.set.link_secs, 3..=60).suffix(" s"));
             let can = !busy && sh.rx().is_some();
             if theme::primary(ui, if self.check.is_some() { "Checking ..." } else { "Check the link" }, can).clicked() {
@@ -183,7 +183,8 @@ impl BoardsPage {
         if sh.ports.is_empty() {
             theme::note(ui, "No USB serial devices found.");
         } else {
-            egui::Grid::new("ports").striped(true).num_columns(4).spacing([28.0, 6.0]).show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt("ports-scroll").show(ui, |ui| {
+                egui::Grid::new("ports").striped(true).num_columns(4).spacing([28.0, 6.0]).show(ui, |ui| {
                 for h in ["Port", "Board", "USB serial", "Product"] {
                     ui.label(RichText::new(h).size(12.5).color(p.text2));
                 }
@@ -203,6 +204,7 @@ impl BoardsPage {
                     ui.label(&pi.product);
                     ui.end_row();
                 }
+                });
             });
         }
         let _ = Vec2::ZERO;

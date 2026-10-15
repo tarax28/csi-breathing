@@ -1,7 +1,7 @@
 //! Tools: replay a recorded test instead of the RX, the selftest, analyse any log, settings.
 
 use super::breath::{self, ResultTab, Shown};
-use super::theme::{self, Level, pal};
+use super::theme::{self, Level};
 use super::{Job, Shared, ThemeChoice};
 use eframe::egui::{self, RichText};
 
@@ -21,7 +21,6 @@ impl Default for ToolsPage {
 
 impl ToolsPage {
     pub fn ui(&mut self, ui: &mut egui::Ui, sh: &mut Shared) {
-        let p = pal(ui);
         if let Some(j) = &self.selftest {
             if let Some(s) = j.poll() {
                 self.selftest_out = Some(s);
@@ -46,7 +45,7 @@ impl ToolsPage {
                 None => theme::status(ui, Level::Good, "The breath test reads the live RX"),
             };
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::secondary(ui, "Replay a test log ...", true).clicked() {
                 if let Some(f) = rfd::FileDialog::new().add_filter("CSI test logs", &["log"]).set_directory(sh.results()).pick_file() {
                     sh.replay = Some(f);
@@ -61,7 +60,7 @@ impl ToolsPage {
         theme::h2(ui, "Check the analysis");
         theme::small(ui, "The selftest makes up two links breathing at 15 and 21 BPM and analyses them.");
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::secondary(ui, if self.selftest.is_some() { "Running the selftest ..." } else { "Run the selftest" }, self.selftest.is_none()).clicked() {
                 self.selftest = Some(Job::spawn(ui.ctx(), crate::session::selftest));
             }
@@ -93,29 +92,33 @@ impl ToolsPage {
         ui.add_space(22.0);
         theme::h2(ui, "Settings");
         ui.add_space(6.0);
-        egui::Grid::new("settings").num_columns(2).spacing([24.0, 12.0]).show(ui, |ui| {
-            ui.label(RichText::new("Results folder").color(p.text2));
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(sh.set.results.display().to_string()).monospace());
-                if ui.button("Change ...").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&sh.set.results).pick_folder() {
-                        sh.set.results = d.clone();
-                        sh.set.results_custom = Some(d);
-                    }
+        theme::field(ui, "Results folder", |ui| {
+            ui.label(RichText::new(sh.set.results.display().to_string()).monospace());
+            if ui.button("Change ...").clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_directory(&sh.set.results).pick_folder() {
+                    sh.set.results = d.clone();
+                    sh.set.results_custom = Some(d);
                 }
-                if ui.button("Open").clicked() {
-                    let _ = open::that(sh.results());
-                }
-            });
-            ui.end_row();
-            ui.label(RichText::new("Appearance").color(p.text2));
+            }
+            if ui.button("Open").clicked() {
+                let _ = open::that(sh.results());
+            }
+        });
+        theme::field(ui, "Appearance", |ui| {
             if theme::segmented(ui, &mut sh.set.theme, &[(ThemeChoice::System, "System"), (ThemeChoice::Light, "Light"), (ThemeChoice::Dark, "Dark")]) {
                 super::apply_theme(ui.ctx(), sh.set.theme);
             }
-            ui.end_row();
-            ui.label(RichText::new("Fitbit login").color(p.text2));
+        });
+        theme::field(ui, "Interface size", |ui| {
+            let sizes: Vec<(u32, String)> = super::UI_SCALES.iter().map(|&s| (s, format!("{s} %"))).collect();
+            theme::segmented(ui, &mut sh.set.ui_scale, &sizes.iter().map(|(s, l)| (*s, l.as_str())).collect::<Vec<_>>());
+            ui.checkbox(&mut sh.set.fit_narrow, "Shrink to fit a narrow window");
+        });
+        theme::field(ui, "", |ui| {
+            theme::small(ui, "Ctrl + and Ctrl − change the size too, Ctrl 0 sets it back to 100 %.");
+        });
+        theme::field(ui, "Fitbit login", |ui| {
             ui.label(RichText::new(crate::health::conf_dir().display().to_string()).monospace());
-            ui.end_row();
         });
         ui.add_space(12.0);
         theme::small(ui, format!("csi-breathing {}. Fonts: Noto Sans (SIL Open Font License).", env!("CARGO_PKG_VERSION")));

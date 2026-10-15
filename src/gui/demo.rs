@@ -1,11 +1,13 @@
 //! Scripted runs for checking the app's look without clicking through it (development aid).
 //!
-//!   CSI_DEMO=<page>[:<action>] CSI_SHOT=out.png [CSI_THEME=dark|light] csi-breathing
+//!   CSI_DEMO=<page>[:<action>] CSI_SHOT=out.png [CSI_THEME=dark|light] [CSI_SIZE=WxH] [CSI_SCALE=%] csi-breathing
 //!
 //! pages: breath, record, nights, fitbit, boards, tools. Actions: breath:past (open the newest
 //! past test with taps), breath:run (replay CSI_REPLAY=<stamp>.log with its recorded taps and
 //! shoot at CSI_AT seconds), nights:analyse (open CSI_NIGHT or the newest multi-part night,
 //! analysing it if needed). The app saves a screenshot of its window to CSI_SHOT and quits.
+//! CSI_SIZE is the window size in points, CSI_SCALE the interface size (Settings::ui_scale).
+//! A demo run keeps its settings and window state in a file of its own in the temp folder.
 
 use super::{App, Page};
 use eframe::egui;
@@ -57,6 +59,9 @@ pub fn step(app: &mut App, ctx: &egui::Context) {
     if !d.began {
         d.began = true;
         app.page = d.page;
+        if let Some(s) = std::env::var("CSI_SCALE").ok().and_then(|v| v.parse().ok()) {
+            app.sh.set.ui_scale = s;
+        }
         match (d.page, d.action.as_str()) {
             (Page::Breath, "past") => app.breath.demo_open_past(ctx, &app.sh),
             (Page::Breath, "run") => {

@@ -253,19 +253,29 @@ impl BreathPage {
         ui.set_max_width(ui.available_width());
         theme::note(ui, "Sit still and breathe normally. Tap Space at the start of every inhale; the app then compares what the WiFi saw with your taps.");
         ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            theme::segmented(ui, &mut sh.set.breath_secs, &[(60, "60 s"), (90, "90 s"), (120, "2 min"), (180, "3 min")]);
-            ui.add_space(8.0);
-            if theme::primary(ui, "Start test", true).clicked() {
-                self.start(sh);
-            }
-            ui.add_space(8.0);
+        let source = |ui: &mut egui::Ui, sh: &Shared| {
             match (&sh.replay, sh.rx()) {
                 (Some(r), _) => theme::status(ui, Level::Warn, format!("Replays {} instead of the RX", r.file_name().unwrap_or_default().to_string_lossy())),
                 (None, Some(rx)) => theme::status(ui, Level::Good, format!("Reads the RX on {}", rx.name)),
                 (None, None) => theme::status(ui, Level::Bad, "RX not plugged in"),
             };
+        };
+        // in a narrow window the note about the source goes under the buttons
+        let roomy = ui.available_width() > 760.0;
+        ui.horizontal_wrapped(|ui| {
+            theme::segmented(ui, &mut sh.set.breath_secs, &[(60, "60 s"), (90, "90 s"), (120, "2 min"), (180, "3 min")]);
+            ui.add_space(8.0);
+            if theme::primary(ui, "Start test", true).clicked() {
+                self.start(sh);
+            }
+            if roomy {
+                ui.add_space(8.0);
+                source(ui, sh);
+            }
         });
+        if !roomy {
+            source(ui, sh);
+        }
         if let Some(e) = &self.error {
             ui.add_space(8.0);
             theme::status(ui, Level::Bad, e.clone());
@@ -375,7 +385,13 @@ impl BreathPage {
             (l.elapsed, l.packets, l.wave.clone(), l.bpm, l.t0)
         };
         let left = (run.secs - el).max(0.0).ceil();
-        // header: time left, then the counts
+        // header: time left, then the counts (under it when the window is narrow)
+        let roomy = ui.available_width() > 800.0;
+        let stats = |ui: &mut egui::Ui| {
+            theme::stat(ui, &run.taps.len().to_string(), "", "taps");
+            theme::stat(ui, &format!("{:.0}", packets as f64 / el.max(0.1)), "/s", "packets");
+            theme::stat(ui, &bpm.map(|b| format!("{:.1}", b.0)).unwrap_or("–".into()), "BPM", "live estimate, last 30 s");
+        };
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{left:.0}")).font(FontId::new(76.0, theme::bold())).color(p.text));
             ui.vertical(|ui| {
@@ -386,15 +402,21 @@ impl BreathPage {
                 );
             });
             // stats pinned to the right edge, laid out left to right inside a fixed box
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.allocate_ui_with_layout(Vec2::new(360.0, 80.0), Layout::left_to_right(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 30.0;
-                    theme::stat(ui, &run.taps.len().to_string(), "", "taps");
-                    theme::stat(ui, &format!("{:.0}", packets as f64 / el.max(0.1)), "/s", "packets");
-                    theme::stat(ui, &bpm.map(|b| format!("{:.1}", b.0)).unwrap_or("–".into()), "BPM", "live estimate, last 30 s");
+            if roomy {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(360.0, 80.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 30.0;
+                        stats(ui);
+                    });
                 });
-            });
+            }
         });
+        if !roomy {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 30.0;
+                stats(ui);
+            });
+        }
         if started && packets == 0 && el > 5.0 {
             theme::status(ui, Level::Bad, "No CSI data is arriving. Is the TX powered and within range?");
         }
@@ -671,7 +693,7 @@ pub fn result_ui(ui: &mut egui::Ui, s: &Shown, tab: &mut ResultTab, id: &str) {
     });
     ui.add_space(8.0);
     let r = s.report.as_ref();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 36.0;
         if let Some(v) = s.reference {
             theme::stat(ui, &format!("{v:.1}"), "BPM", "you counted");
