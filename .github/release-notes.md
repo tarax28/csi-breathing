@@ -1,3 +1,9 @@
+## What's new in v0.3.0
+
+- **Fewer lost packets, also on macOS.** The RX firmware now sends each CSI packet as ~400 bytes (raw values in base64 plus the gain) instead of 830-1100 bytes of decimal text, so 100 packets/s fits the USB serial link with room to spare. **Flash the RX again** (Boards page) to get it; older logs still open.
+- Embedded firmware set to channel 157, country IT, TX 6.75 dBm (was channel 161, US).
+- Apps older than v0.3.0 cannot read recordings from the new RX firmware.
+
 ## Downloads
 
 | System | File | How to run |

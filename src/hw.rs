@@ -113,7 +113,9 @@ pub fn verify_link(port: &str, secs: f64) -> Result<(bool, String)> {
                     chs.push(ch);
                     payloads.push(data.to_string());
                     if nsc == 0 {
-                        nsc = data.trim_matches(|c| c == '[' || c == ']' || c == '"').split(',').count() / 2;
+                        let mut q = data.splitn(2, '"');
+                        let (d, tail) = (q.next().unwrap_or(""), q.next().unwrap_or(""));
+                        nsc = crate::analysis::csi_values(d, tail).map_or(0, |v| v.len() / 2);
                     }
                     continue;
                 }

@@ -97,12 +97,33 @@ pub struct Recording {
     pub bad: usize,
 }
 
+/// The CSI values of a line, from the text between the quotes and what follows them.
+/// Old firmware: `"[v0,v1,...]"`, already (int16)(compensate_gain * raw).
+/// New firmware: `"<base64 raw int8>",gggggggg` with the gain as float32 bits in hex; the
+/// values are rebuilt as the firmware computed them, (int16)(gain * raw) in f32 (csi_line.py).
+pub fn csi_values(data: &str, tail: &str) -> Option<Vec<i16>> {
+    if data.starts_with('[') {
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        return data.trim_matches(|c| c == '[' || c == ']').split(',').map(|s| s.trim().parse().ok()).collect();
+    }
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let g = tail.trim().strip_prefix(',')?;
+    if g.len() != 8 {
+        return None;
+    }
+    let g = f32::from_bits(u32::from_str_radix(g, 16).ok()?);
+    Some(raw.iter().map(|&b| (g * (b as i8) as f32) as i16).collect())
+}
+
 fn parse_line(line: &[u8]) -> Option<(i64, i32, i64, Vec<[f32; 2]>)> {
     let mut parts = line.split(|&b| b == b'"');
     let head = parts.next()?;
     let data = parts.next()?;
     let tail = parts.next()?;
-    if parts.next().is_some() || !tail.iter().all(|b| b.is_ascii_whitespace()) {
+    if parts.next().is_some() {
         return None;
     }
     let head = std::str::from_utf8(head).ok()?;
@@ -110,13 +131,7 @@ fn parse_line(line: &[u8]) -> Option<(i64, i32, i64, Vec<[f32; 2]>)> {
     if p.len() != 14 {
         return None;
     }
-    let data = std::str::from_utf8(data).ok()?;
-    let body = data.trim_matches(|c| c == '[' || c == ']');
-    let mut v = Vec::with_capacity(256);
-    for s in body.split(',') {
-        let x: i16 = s.trim().parse().ok()?;
-        v.push(x);
-    }
+    let v = csi_values(std::str::from_utf8(data).ok()?, std::str::from_utf8(tail).ok()?)?;
     let len: usize = p[12].trim().parse().ok()?;
     if v.len() != len || v.len() % 2 != 0 {
         return None;
