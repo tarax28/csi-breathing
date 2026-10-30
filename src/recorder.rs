@@ -2,6 +2,8 @@
 //! Same files and log lines (the GUI and night.sh read "recording to", "DATA FLOWING" and the
 //! once-a-minute status line). Runs as `csi-breathing record-night ...`, normally started
 //! detached by the GUI. Stop: Ctrl-C/SIGTERM, or a file named STOP in the output folder.
+//! An interruption (the computer slept, the port failed, no data) prints "DATA STOPPED" and "DATA BACK",
+//! goes into night.json as a gap, and starts a new part, so that each part has one chip clock.
 
 use crate::hw;
 use anyhow::Result;
@@ -14,6 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// The read loop turns over at least every 200 ms: a longer jump of the wall clock means this process did
+/// not run (the computer slept, Modern Standby suspended it), which no serial call reports by itself.
+const FROZEN_S: f64 = 10.0;
+/// After `stall_s` without data the port is reopened, then at growing intervals up to this.
+const MAX_STALL_S: f64 = 300.0;
 
 fn stamp(fmt: &str) -> String {
     chrono::Local::now().format(fmt).to_string()
@@ -29,6 +37,22 @@ pub struct Args {
     pub part_min: f64,
     pub min_free_gb: f64,
     pub results: PathBuf,
+    pub stall_s: f64,
+    pub keep_awake: bool,
+}
+
+fn mins(s: f64) -> String {
+    if s < 90.0 { format!("{s:.0} s") } else { format!("{:.1} min", s / 60.0) }
+}
+
+fn close_gap(summary: &mut serde_json::Value, (from, why): (f64, &str), to: f64, back: bool) {
+    let clock = |t: f64| crate::night::clock(t, "%H:%M:%S");
+    summary["gaps"].as_array_mut().unwrap().push(json!({"from": clock(from), "to": clock(to), "from_epoch": from, "to_epoch": to, "s": to - from, "why": why}));
+    if back {
+        say!("{}  DATA BACK after {} ({why})", stamp("%H:%M:%S"), mins(to - from));
+    } else {
+        say!("{}  no data for the last {} of the recording ({why})", stamp("%H:%M:%S"), mins(to - from));
+    }
 }
 
 fn dir_size(d: &Path) -> u64 {
@@ -44,7 +68,10 @@ pub fn run(a: Args) -> Result<()> {
         libc::signal(libc::SIGINT, on_sig as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_sig as *const () as libc::sighandler_t);
     }
-    hw::keep_awake();
+    let awake = a.keep_awake.then(hw::keep_awake);
+    if matches!(awake, Some(None)) {
+        say!("{}  could not ask the system to stay awake: it may sleep during the recording", stamp("%H:%M:%S"));
+    }
     let start = hw::now();
     let out = a.results.join(format!("night-{}", stamp("%Y%m%d-%H%M%S")));
     std::fs::create_dir_all(&out)?;
@@ -52,7 +79,7 @@ pub fn run(a: Args) -> Result<()> {
     let stopped = || STOP.load(Ordering::SeqCst) || stop_file.exists();
     let end_at = if a.hours > 0.0 { start + a.hours * 3600.0 } else { f64::INFINITY };
     let mut summary = json!({"port": a.port, "start": stamp("%Y-%m-%d %H:%M:%S"), "start_epoch": start,
-        "part_min": a.part_min, "parts": [], "reconnects": 0});
+        "part_min": a.part_min, "parts": [], "gaps": [], "reconnects": 0});
     let save = |summary: &mut serde_json::Value| {
         summary["end"] = json!(stamp("%Y-%m-%d %H:%M:%S"));
         summary["end_epoch"] = json!(hw::now());
@@ -94,6 +121,8 @@ pub fn run(a: Args) -> Result<()> {
     let mut chunk = vec![0u8; 65536];
     let (mut last_seq, mut last_clock, mut last_status, mut flowing) = (None::<i64>, 0.0, hw::now(), false);
     let (mut tot_frames, mut tot_lost, mut tot_raw) = (0u64, 0u64, 0u64);
+    let mut gap: Option<(f64, &str)> = None;
+    let (mut last_tick, mut last_data, mut stall_after) = (hw::now(), None::<f64>, a.stall_s);
     while !stopped() && hw::now() < end_at && s.is_some() {
         part_no += 1;
         let name = format!("part-{part_no:04}");
@@ -105,21 +134,47 @@ pub fn run(a: Args) -> Result<()> {
             let mut clk = std::io::BufWriter::new(std::fs::File::create(out.join(format!("{name}.clock.csv")))?);
             writeln!(clk, "seq,host_time")?;
             while !stopped() && hw::now() < part_end.min(end_at) {
-                let n = match s.as_mut().unwrap().read(&mut chunk) {
-                    Ok(n) => n,
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-                    Err(e) => {
-                        say!("{}  serial error: {e}; reconnecting", stamp("%H:%M:%S"));
-                        summary["reconnects"] = json!(summary["reconnects"].as_u64().unwrap_or(0) + 1);
-                        buf.clear();
-                        s = open_port();
-                        if s.is_none() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
+                let read = s.as_mut().unwrap().read(&mut chunk);
                 let now = hw::now();
+                let frozen_from = (now - last_tick > FROZEN_S).then_some(last_tick);
+                last_tick = now;
+                let (n, serial_err) = match read {
+                    Ok(n) => (n, None),
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (0, None),
+                    Err(e) => (0, Some(e)),
+                };
+                let silent = last_data.filter(|&t| now - t > stall_after);
+                if frozen_from.is_some() || serial_err.is_some() || silent.is_some() {
+                    let clock = stamp("%H:%M:%S");
+                    let (from, why) = if let Some(t) = frozen_from {
+                        let was = crate::night::clock(t, "%H:%M:%S");
+                        say!("{clock}  DATA STOPPED: the computer slept or suspended this program from {was} ({}), nothing was recorded", mins(now - t));
+                        (t, "computer asleep")
+                    } else if let Some(e) = &serial_err {
+                        say!("{clock}  DATA STOPPED: serial error: {e}; reconnecting");
+                        (last_data.unwrap_or(now), "serial error")
+                    } else if gap.is_none() {
+                        say!("{clock}  DATA STOPPED: nothing for {}; reopening the port", mins(now - silent.unwrap()));
+                        (silent.unwrap(), "no data")
+                    } else {
+                        say!("{clock}  still no data; reopening the port");
+                        (now, "no data")
+                    };
+                    let first = gap.is_none();
+                    gap.get_or_insert((from, why));
+                    summary["reconnects"] = json!(summary["reconnects"].as_u64().unwrap_or(0) + 1);
+                    buf.clear();
+                    last_seq = None; // what went past during the gap is the gap, not packet loss
+                    drop(s.take()); // close first: a port stays exclusive while it is open
+                    s = open_port();
+                    last_tick = hw::now();
+                    stall_after = if first { a.stall_s } else { (stall_after * 2.0).min(MAX_STALL_S) };
+                    last_data = last_data.map(|_| last_tick);
+                    if first || s.is_none() {
+                        break;
+                    }
+                    continue;
+                }
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(i) = buf.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = buf.drain(..=i).collect();
@@ -130,6 +185,12 @@ pub fn run(a: Args) -> Result<()> {
                     gz.write_all(line)?;
                     gz.write_all(b"\n")?;
                     frames += 1;
+                    last_data = Some(now);
+                    stall_after = a.stall_s;
+                    if let Some(g) = gap.take() {
+                        close_gap(&mut summary, g, now, true);
+                        save(&mut summary);
+                    }
                     raw += line.len() as u64 + 1;
                     if !flowing && frames >= 100 {
                         flowing = true;
@@ -182,14 +243,19 @@ pub fn run(a: Args) -> Result<()> {
         save(&mut summary);
         say!("{}  {name}: {frames} frames, {lost} lost, {:.1} MB raw -> {:.1} MB gz", stamp("%H:%M:%S"), raw as f64 / 1e6, gzsz as f64 / 1e6);
     }
+    if let Some(g) = gap.take() {
+        close_gap(&mut summary, g, hw::now(), false);
+    }
     save(&mut summary);
     let el = hw::now() - start;
+    let gaps = summary["gaps"].as_array().map(|g| (g.len(), g.iter().filter_map(|x| x["s"].as_f64()).sum::<f64>())).unwrap_or_default();
     say!(
-        "done: {:.2} h, {} frames ({:.1}/s), {} lost, {} parts in {}",
+        "done: {:.2} h, {} frames ({:.1}/s), {} lost, {}{} parts in {}",
         el / 3600.0,
         tot_frames,
         tot_frames as f64 / el.max(1.0),
         tot_lost,
+        if gaps.0 > 0 { format!("{} interruptions ({} without data), ", gaps.0, mins(gaps.1)) } else { String::new() },
         part_no,
         out.display()
     );

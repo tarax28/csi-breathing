@@ -186,6 +186,8 @@ pub struct Shared {
     pub flashing: bool,
     /// the detached night recorder is running
     pub recording: bool,
+    /// the window is a black full screen until a key or click (record::blank_screen)
+    pub blackout: bool,
     pub record_status: String,
     pub goto: Option<Page>,
     /// set by a breath test / tools analysis, read by the Tools page when it changes
@@ -234,6 +236,7 @@ impl Shared {
 pub struct App {
     pub(crate) page: Page,
     results_seen: PathBuf,
+    blacked_out: bool,
     demo: Option<demo::Demo>,
     pub(crate) sh: Shared,
     pub(crate) breath: breath::BreathPage,
@@ -269,6 +272,7 @@ impl App {
             capturing: false,
             flashing: false,
             recording: false,
+            blackout: false,
             record_status: String::new(),
             goto: None,
             tools_analysis: None,
@@ -280,6 +284,7 @@ impl App {
         App {
             page: Page::Breath,
             results_seen: sh.set.results.clone(),
+            blacked_out: false,
             demo: demo::Demo::from_env(),
             breath: breath::BreathPage::new(&sh),
             nights: nights::NightsPage::new(&sh),
@@ -313,6 +318,16 @@ impl eframe::App for App {
         self.record.poll(&ctx, &mut self.sh);
         self.breath.poll(&ctx, &mut self.sh);
         ctx.request_repaint_after(Duration::from_millis(1000));
+        if self.sh.blackout != self.blacked_out {
+            self.blacked_out = self.sh.blackout;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.blacked_out));
+        }
+        if self.sh.blackout {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::BLACK)).show(ui, |_| {});
+            self.sh.blackout = !ctx.input(|i| i.pointer.any_pressed() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })));
+            return;
+        }
         if self.sh.set.results != self.results_seen {
             self.results_seen = self.sh.set.results.clone();
             let _ = self.sh.ensure_results();

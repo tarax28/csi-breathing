@@ -25,6 +25,9 @@ pub struct RecordPage {
     log: Log,
     stats: Stats,
     flowing: bool,
+    /// no data right now, and how many times that has happened in this recording
+    stopped: bool,
+    gaps: u32,
     started: Option<Instant>,
     screen_done: bool,
     last_poll: Option<Instant>,
@@ -78,6 +81,8 @@ impl RecordPage {
             log: Log::default(),
             stats: Stats::default(),
             flowing: false,
+            stopped: false,
+            gaps: 0,
             started: None,
             screen_done: false,
             last_poll: None,
@@ -118,6 +123,13 @@ impl RecordPage {
             if line.contains("DATA FLOWING") {
                 self.flowing = true;
             }
+            if line.contains("DATA STOPPED") && !self.stopped {
+                self.stopped = true;
+                self.gaps += 1;
+            }
+            if line.contains("DATA BACK") {
+                self.stopped = false;
+            }
             if line.starts_with("done:") {
                 self.last_done = Some(line.to_string());
             }
@@ -137,10 +149,14 @@ impl RecordPage {
         if self.flowing && !was_flowing && !self.screen_done && self.pid.is_some() {
             self.screen_done = true;
             if sh.set.screen_off {
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_secs(2));
-                    hw::screen_off();
-                });
+                if cfg!(windows) {
+                    blank_screen(sh);
+                } else {
+                    std::thread::spawn(|| {
+                        std::thread::sleep(Duration::from_secs(2));
+                        hw::screen_off();
+                    });
+                }
             }
         }
         if let Some(p) = self.pid {
@@ -152,6 +168,7 @@ impl RecordPage {
         }
         sh.recording = self.pid.is_some();
         sh.record_status = match (self.pid.is_some(), self.stats.elapsed_h, self.flowing) {
+            (true, ..) if self.stopped => "Recorder has no data".into(),
             (true, Some(h), _) => format!("Recording, {}", hours(h)),
             (true, None, true) => "Recording".into(),
             (true, None, false) => "Recorder waiting for data".into(),
@@ -195,6 +212,9 @@ impl RecordPage {
             "--results".into(),
             results.to_string_lossy().into(),
         ];
+        if !sh.set.keep_awake {
+            cmd.push("--no-keep-awake".into());
+        }
         if cfg!(unix) && sh.set.keep_awake {
             if cfg!(target_os = "macos") && which("caffeinate") {
                 let mut c: Vec<String> = vec!["caffeinate".into(), "-i".into(), "-s".into()];
@@ -249,6 +269,8 @@ impl RecordPage {
                 self.dir = None;
                 self.pos = 0;
                 self.flowing = false;
+                self.stopped = false;
+                self.gaps = 0;
                 self.stats = Stats::default();
                 self.screen_done = false;
                 self.started = Some(Instant::now());
@@ -287,12 +309,19 @@ impl RecordPage {
             ui,
             "Records the RX all night into 10-minute compressed parts. The recording keeps running if you close this window; open the app again to follow it.",
         );
+        if cfg!(windows) {
+            theme::note(ui, "Keep the PC plugged in with the lid open: closing the lid or pressing the power button still puts it to sleep, and no recording happens until it wakes.");
+        }
         ui.add_space(16.0);
 
         // state
         let (lvl, head, sub) = if rec {
             let waited = self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-            if self.flowing {
+            if self.stopped {
+                (Level::Bad, "Data stopped".to_string(), "Nothing is arriving. The recorder keeps trying; the output below says since when.".to_string())
+            } else if self.flowing && self.gaps > 0 {
+                (Level::Warn, "Recording".to_string(), format!("Data is flowing, but it was interrupted {} time(s): the output below says when.", self.gaps))
+            } else if self.flowing {
                 (Level::Good, "Recording".to_string(), "Data is flowing.".to_string())
             } else if waited > 60.0 {
                 (Level::Bad, "No data yet".into(), "Nothing has arrived for a minute: check that the TX is powered and the RX plugged in.".into())
@@ -336,7 +365,7 @@ impl RecordPage {
                 } else if theme::primary(ui, "Start recording", true).clicked() {
                     self.start(sh);
                 }
-                if theme::secondary(ui, "Turn the screen off", true).clicked() && !hw::screen_off() {
+                if theme::secondary(ui, "Turn the screen off", true).clicked() && !blank_screen(sh) {
                     self.msg = Some((Level::Warn, "This desktop has no known way to turn the screen off.".into()));
                 }
                 if theme::secondary(ui, "Open folder", self.dir.is_some()).clicked() {
@@ -364,11 +393,15 @@ impl RecordPage {
                 ui.end_row();
                 ui.label("");
                 ui.checkbox(&mut sh.set.keep_awake, "Keep the computer awake").on_hover_text(
-                    "Linux: systemd-inhibit (and Omarchy stay-awake). macOS: caffeinate. Windows: the recorder itself. Keep a laptop's lid open: closing it can still suspend.",
+                    "Linux: systemd-inhibit (and Omarchy stay-awake). macOS: caffeinate. Windows: the recorder itself, which also keeps the display powered. Keep a laptop's lid open: closing it can still suspend.",
                 );
                 ui.end_row();
                 ui.label("");
-                ui.checkbox(&mut sh.set.screen_off, "Turn the screen off once data flows");
+                ui.checkbox(&mut sh.set.screen_off, "Turn the screen off once data flows").on_hover_text(if cfg!(windows) {
+                    "Windows: the window goes black and full screen, any key or click brings it back. The display itself stays powered, because switching it off puts many laptops to sleep and stops the recording."
+                } else {
+                    "Any key or mouse movement turns it back on."
+                });
                 ui.end_row();
             });
         });
@@ -377,6 +410,16 @@ impl RecordPage {
         ui.add_space(4.0);
         theme::log_view(ui, "night-out", &self.log.lines(), 280.0);
     }
+}
+
+/// On Windows a black full-screen window, not a display that is off: SC_MONITORPOWER takes a Modern Standby
+/// laptop into standby, which froze a recording 5 s after it started (night-20261030-011149).
+fn blank_screen(sh: &mut Shared) -> bool {
+    if cfg!(windows) {
+        sh.blackout = true;
+        return true;
+    }
+    hw::screen_off()
 }
 
 fn hours(h: f64) -> String {

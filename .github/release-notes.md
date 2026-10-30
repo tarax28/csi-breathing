@@ -1,8 +1,8 @@
-## What's new in v0.3.0
+## What's new in v0.3.1
 
-- **Fewer lost packets, also on macOS.** The RX firmware now sends each CSI packet as ~400 bytes (raw values in base64 plus the gain) instead of 830-1100 bytes of decimal text, so 100 packets/s fits the USB serial link with room to spare. **Flash the RX again** (Boards page) to get it; older logs still open.
-- Embedded firmware set to channel 157, country IT, TX 6.75 dBm (was channel 161, US).
-- Apps older than v0.3.0 cannot read recordings from the new RX firmware.
+- **Windows: recordings no longer freeze when the screen goes off.** Turning the display off could put a laptop with Modern Standby to sleep a few seconds into the recording, and nothing was recorded until it woke. On Windows, "Turn the screen off" now shows a black full-screen window instead (any key or click brings the app back) and the display stays powered, so lower the brightness for the night. Keep the PC plugged in with the lid open: closing the lid or pressing the power button still puts it to sleep.
+- **Interruptions are reported.** If the computer sleeps, the serial port fails or no data arrives, the recorder says so, reopens the port and starts a new part. The Record page shows it, the last line of the output counts it, `night.json` lists each gap, and frames missed during a gap no longer count as lost.
+- Windows: the "Keep the computer awake" checkbox is now honoured.
 
 ## Downloads
 

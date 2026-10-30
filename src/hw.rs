@@ -362,22 +362,39 @@ pub fn free_space(path: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Keep the PC from sleeping while this process runs (Windows; Linux uses systemd-inhibit, macOS caffeinate).
-pub fn keep_awake() {
+/// Holds the PC awake until dropped, on the thread that took it (Windows; Linux uses systemd-inhibit,
+/// macOS caffeinate). The display is held on too: on a Modern Standby PC a display that goes off takes
+/// the whole machine into standby, and this process with it, whatever ES_SYSTEM_REQUIRED says.
+pub struct KeepAwake;
+
+/// None if Windows refused the request.
+pub fn keep_awake() -> Option<KeepAwake> {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::System::Power::{ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+        use windows_sys::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
+        if SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) == 0 {
+            return None;
+        }
+    }
+    Some(KeepAwake)
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Power::{ES_CONTINUOUS, SetThreadExecutionState};
+            SetThreadExecutionState(ES_CONTINUOUS);
+        }
     }
 }
 
-/// Turn the display off (any key/mouse wakes it). Returns false if no method is known.
+/// Turn the display off (any key/mouse wakes it). Returns false if no method is known. Not on Windows:
+/// SC_MONITORPOWER puts a Modern Standby PC to sleep and freezes the recorder (see gui::record::blank_screen).
 pub fn screen_off() -> bool {
     #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, PostMessageW, SC_MONITORPOWER, WM_SYSCOMMAND};
-        PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER as usize, 2);
-        return true;
+    {
+        false
     }
     #[cfg(unix)]
     {

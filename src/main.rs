@@ -11,7 +11,7 @@ usage:
   csi-breathing analyze <log> [--ref-bpm X] [--ref-hr X] [--breaths out.csv]
   csi-breathing taps <results/stamp>    breath test vs its taps
   csi-breathing night <night-folder> [--epoch MIN] [--no-health] [--refresh-health]
-  csi-breathing record-night --port P [--hours H] [--part-min M] [--min-free-gb G] [--results DIR]
+  csi-breathing record-night --port P [--hours H] [--part-min M] [--min-free-gb G] [--results DIR] [--stall-s S] [--no-keep-awake]
   csi-breathing selftest";
 
 fn arg(args: &[String], k: &str) -> Option<String> {
@@ -79,6 +79,8 @@ fn main() -> anyhow::Result<()> {
                 hours: num(&args, "--hours", 9.0)?,
                 part_min: num(&args, "--part-min", 10.0)?,
                 min_free_gb: num(&args, "--min-free-gb", 1.0)?,
+                stall_s: num(&args, "--stall-s", 30.0)?,
+                keep_awake: !args.iter().any(|a| a == "--no-keep-awake"),
                 results: arg(&args, "--results").map(PathBuf::from).unwrap_or_else(csi_breathing::gui::default_results),
             })?;
         }
